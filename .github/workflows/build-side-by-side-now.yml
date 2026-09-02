@@ -124,7 +124,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          vp run dist:desktop:artifact -- \
+          vp run dist:desktop:artifact \
             --platform win \
             --target nsis \
             --arch x64 \
