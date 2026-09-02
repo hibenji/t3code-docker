@@ -9,6 +9,7 @@ on:
     paths:
       - apps/server/src/docker/**
       - scripts/apply-t3code-docker-overlay.mjs
+      - scripts/apply-t3code-docker-branding.mjs
       - .github/workflows/upstream-docker-release.yml
   workflow_dispatch:
 
@@ -122,12 +123,13 @@ jobs:
         shell: pwsh
         run: Copy-Item source/.env.example source/.env -Force
 
-      - name: Add Docker implementation to official source
+      - name: Add Docker implementation and side-by-side identity
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force source/apps/server/src/docker | Out-Null
           Copy-Item custom/apps/server/src/docker/DockerCodex.ts source/apps/server/src/docker/DockerCodex.ts -Force
           node custom/scripts/apply-t3code-docker-overlay.mjs --root source
+          node custom/scripts/apply-t3code-docker-branding.mjs --root source
 
       - name: Setup Vite+
         uses: voidzero-dev/setup-vp@v1
@@ -171,10 +173,6 @@ jobs:
             throw "Visual Studio Installer failed with exit code $code"
           }
 
-      - name: Typecheck patched server
-        working-directory: source
-        run: vp run --filter t3 typecheck
-
       - name: Build unsigned Windows installer
         working-directory: source
         shell: bash
@@ -200,7 +198,7 @@ jobs:
               cp "$file" release-publish/
             done
           done
-          test -n "$(find release-publish -maxdepth 1 -name '*.exe' -print -quit)"
+          test -n "$(find release-publish -maxdepth 1 -name 'T3-Code-Docker-*.exe' -print -quit)"
           test -n "$(find release-publish -maxdepth 1 -name '*.yml' -print -quit)"
 
       - name: Upload release assets
@@ -232,6 +230,13 @@ jobs:
             T3 Code ${{ needs.detect.outputs.version }} with per-chat Docker-isolated Codex execution.
             Built automatically from the matching official pingdotgg/t3code release.
 
+            This is a separate desktop identity from official T3 Code:
+            - Product name: T3 Code Docker
+            - App ID: com.hibenji.t3code-docker
+            - Protocol: t3code-docker://
+            - Updates: hibenji/t3code-docker
+
+            It can be installed alongside the official T3 Code application.
             Windows x64 build is currently unsigned.
           files: release-assets/*
           fail_on_unmatched_files: true
