@@ -16,6 +16,23 @@ const CONTAINER_CODEX_HOME = "/root/.codex";
 const WRAPPER_DIR_NAME = "docker-codex-wrappers";
 const DOCKER_OUTPUT_LIMIT = 16 * 1024 * 1024;
 
+// Host-native generated dependency/build trees are deliberately not copied
+// into the Linux container or mirrored back. They are large and commonly hold
+// platform-specific binaries that are invalid on the other side of the
+// Windows/macOS <-> Linux boundary.
+const DEFAULT_IGNORED_PATH_SEGMENTS = new Set([
+  ".git",
+  ".venv",
+  "node_modules",
+  ".next",
+  ".cache",
+  "coverage",
+  "dist",
+  "build",
+  "target",
+  "__pycache__",
+]);
+
 const FORWARDED_ENVIRONMENT_NAMES = [
   "OPENAI_API_KEY",
   "OPENAI_BASE_URL",
@@ -34,6 +51,7 @@ export interface DockerCodexSession {
   readonly containerName: string;
   readonly binaryPath: string;
   readonly workspacePath: typeof CONTAINER_WORKSPACE;
+  readonly hostWorkspacePath: string;
 }
 
 export interface PrepareDockerCodexSessionInput {
@@ -111,6 +129,34 @@ function dockerPortArgs(): Array<string> {
   return ports.flatMap((port) => ["-p", `127.0.0.1::${port}`]);
 }
 
+function extraIgnoredSegments(): Set<string> {
+  const values = process.env.T3CODE_DOCKER_IGNORE?.split(",") ?? [];
+  return new Set(values.map((value) => value.trim()).filter(Boolean));
+}
+
+function isIgnoredRelativePath(relativePath: string): boolean {
+  if (!relativePath || relativePath === ".") return false;
+  const extra = extraIgnoredSegments();
+  return relativePath
+    .split(/[\\/]+/u)
+    .filter(Boolean)
+    .some((segment) => DEFAULT_IGNORED_PATH_SEGMENTS.has(segment) || extra.has(segment));
+}
+
+async function copyTreeForDocker(source: string, destination: string): Promise<void> {
+  await NodeFs.mkdir(destination, { recursive: true });
+  await NodeFs.cp(source, destination, {
+    recursive: true,
+    force: true,
+    errorOnExist: false,
+    preserveTimestamps: true,
+    filter: (candidate) => {
+      const relative = NodePath.relative(source, candidate);
+      return !isIgnoredRelativePath(relative);
+    },
+  });
+}
+
 async function ensureDefaultImage(image: string): Promise<void> {
   if (await dockerSucceeds(["image", "inspect", image])) {
     return;
@@ -185,17 +231,94 @@ async function ensureContainer(input: PrepareDockerCodexSessionInput, image: str
   return containerName;
 }
 
-async function syncWorkspace(containerName: string, cwd: string): Promise<void> {
+async function initializeWorkspaceGit(containerName: string): Promise<void> {
+  // T3 worktrees have a .git file whose gitdir points to host-only metadata.
+  // A copied container workspace therefore gets a local baseline repository so
+  // git status/diff remain useful to Codex without sharing host worktree state.
   await docker([
     "exec",
     containerName,
     "sh",
     "-lc",
-    `mkdir -p ${CONTAINER_WORKSPACE} && find ${CONTAINER_WORKSPACE} -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +`,
+    [
+      `cd ${CONTAINER_WORKSPACE}`,
+      "rm -rf .git",
+      "git init -q",
+      'git config user.name "T3 Code Docker"',
+      'git config user.email "t3code-docker@localhost"',
+      "git add -A",
+      'git commit --allow-empty --no-gpg-sign -qm "T3 Code Docker baseline"',
+    ].join(" && "),
   ]);
+}
 
-  const source = `${NodePath.resolve(cwd)}${NodePath.sep}.`;
-  await docker(["cp", source, `${containerName}:${CONTAINER_WORKSPACE}`]);
+async function syncWorkspaceToContainer(containerName: string, cwd: string): Promise<void> {
+  const stageDir = await NodeFs.mkdtemp(NodePath.join(NodeOs.tmpdir(), "t3code-docker-in-"));
+  try {
+    await copyTreeForDocker(NodePath.resolve(cwd), stageDir);
+    await docker([
+      "exec",
+      containerName,
+      "sh",
+      "-lc",
+      `mkdir -p ${CONTAINER_WORKSPACE} && find ${CONTAINER_WORKSPACE} -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +`,
+    ]);
+    await docker(["cp", `${stageDir}${NodePath.sep}.`, `${containerName}:${CONTAINER_WORKSPACE}`]);
+    await initializeWorkspaceGit(containerName);
+  } finally {
+    await NodeFs.rm(stageDir, { recursive: true, force: true });
+  }
+}
+
+async function removeManagedEntriesMissingFromSource(source: string, destination: string): Promise<void> {
+  const sourceEntries = new Set(await NodeFs.readdir(source));
+  for (const name of await NodeFs.readdir(destination)) {
+    if (DEFAULT_IGNORED_PATH_SEGMENTS.has(name) || extraIgnoredSegments().has(name)) {
+      continue;
+    }
+    if (!sourceEntries.has(name)) {
+      await NodeFs.rm(NodePath.join(destination, name), { recursive: true, force: true });
+    }
+  }
+}
+
+async function mirrorDirectory(source: string, destination: string): Promise<void> {
+  await NodeFs.mkdir(destination, { recursive: true });
+  await removeManagedEntriesMissingFromSource(source, destination);
+
+  for (const entry of await NodeFs.readdir(source, { withFileTypes: true })) {
+    if (DEFAULT_IGNORED_PATH_SEGMENTS.has(entry.name) || extraIgnoredSegments().has(entry.name)) {
+      continue;
+    }
+
+    const sourcePath = NodePath.join(source, entry.name);
+    const destinationPath = NodePath.join(destination, entry.name);
+    if (entry.isDirectory()) {
+      await mirrorDirectory(sourcePath, destinationPath);
+      continue;
+    }
+
+    await NodeFs.rm(destinationPath, { recursive: true, force: true });
+    if (entry.isSymbolicLink()) {
+      const linkTarget = await NodeFs.readlink(sourcePath);
+      await NodeFs.symlink(linkTarget, destinationPath);
+    } else {
+      await NodeFs.copyFile(sourcePath, destinationPath);
+    }
+  }
+}
+
+async function syncWorkspaceToHost(containerName: string, cwd: string): Promise<void> {
+  const stageDir = await NodeFs.mkdtemp(NodePath.join(NodeOs.tmpdir(), "t3code-docker-out-"));
+  try {
+    await docker(["cp", `${containerName}:${CONTAINER_WORKSPACE}/.`, stageDir]);
+    // The local .git baseline is intentionally never copied back; host Git and
+    // T3 retain ownership of branch/worktree metadata.
+    await NodeFs.rm(NodePath.join(stageDir, ".git"), { recursive: true, force: true });
+    await mirrorDirectory(stageDir, NodePath.resolve(cwd));
+  } finally {
+    await NodeFs.rm(stageDir, { recursive: true, force: true });
+  }
 }
 
 async function syncCodexHome(containerName: string, homePath: string | undefined): Promise<void> {
@@ -270,7 +393,7 @@ async function prepare(input: PrepareDockerCodexSessionInput): Promise<DockerCod
       "pkill -f '[c]odex app-server' >/dev/null 2>&1 || true",
     ]);
 
-    await syncWorkspace(containerName, input.cwd);
+    await syncWorkspaceToContainer(containerName, input.cwd);
     await syncCodexHome(containerName, input.homePath);
     await docker(["exec", containerName, "codex", "--version"]);
 
@@ -279,10 +402,18 @@ async function prepare(input: PrepareDockerCodexSessionInput): Promise<DockerCod
       containerName,
       binaryPath,
       workspacePath: CONTAINER_WORKSPACE,
+      hostWorkspacePath: NodePath.resolve(input.cwd),
     };
   } catch (cause) {
     throw new Error(`Failed to prepare Docker-isolated Codex session: ${errorMessage(cause)}`);
   }
+}
+
+function asEffect(operation: () => Promise<void>, action: string): Effect.Effect<void, Error> {
+  return Effect.tryPromise({
+    try: operation,
+    catch: (cause) => new Error(`${action}: ${errorMessage(cause)}`),
+  });
 }
 
 export function prepareDockerCodexSession(
@@ -292,6 +423,22 @@ export function prepareDockerCodexSession(
     try: () => prepare(input),
     catch: (cause) => (cause instanceof Error ? cause : new Error(errorMessage(cause))),
   });
+}
+
+export function syncDockerWorkspaceToContainer(
+  session: DockerCodexSession,
+): Effect.Effect<void, Error> {
+  return asEffect(
+    () => syncWorkspaceToContainer(session.containerName, session.hostWorkspacePath),
+    "Failed to refresh Docker workspace from host",
+  );
+}
+
+export function syncDockerWorkspaceToHost(session: DockerCodexSession): Effect.Effect<void, Error> {
+  return asEffect(
+    () => syncWorkspaceToHost(session.containerName, session.hostWorkspacePath),
+    "Failed to mirror Docker workspace back to host",
+  );
 }
 
 /**
