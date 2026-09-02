@@ -49,6 +49,20 @@ async function patchBuildScript() {
     'artifactName: "T3-Code-Docker-${version}-${arch}.${ext}",',
     "desktop artifact name",
   );
+
+  // GitHub's current windows-latest image ships Visual Studio 2026. The old
+  // Spectre component IDs used by upstream are no longer present in that
+  // product graph, so vswhere reports the toolchain missing even though the
+  // normal MSVC C++ tools and Windows SDK are installed. The resource monitor
+  // is subsequently compiled with Cargo, which is the authoritative build
+  // check. Keep the C++/SDK preflight but drop only the obsolete component ID.
+  content = replaceOnce(
+    content,
+    `    arch === "arm64"\n      ? [\n          "Microsoft.VisualStudio.Component.VC.Tools.ARM64",\n          "Microsoft.VisualStudio.Component.VC.Tools.ARM64.Spectre",\n        ]\n      : [\n          "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",\n          "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre",\n        ];`,
+    `    arch === "arm64"\n      ? ["Microsoft.VisualStudio.Component.VC.Tools.ARM64"]\n      : ["Microsoft.VisualStudio.Component.VC.Tools.x86.x64"];`,
+    "Visual Studio prerequisite component list",
+  );
+
   await write(file, content);
 }
 
