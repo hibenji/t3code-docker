@@ -1,0 +1,49 @@
+name: Materialize Docker overlay
+
+on:
+  push:
+    branches:
+      - feature/docker-chat-execution-real
+    paths:
+      - scripts/apply-t3code-docker-overlay.mjs
+      - apps/server/src/docker/DockerCodex.ts
+      - .github/workflows/materialize-docker-overlay.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: materialize-docker-overlay-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  materialize:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply Docker source overlay
+        run: node scripts/apply-t3code-docker-overlay.mjs
+
+      - name: Commit materialized source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add \
+            apps/server/src/provider/Layers/CodexProvider.ts \
+            apps/server/src/provider/Layers/CodexAdapter.ts \
+            apps/server/src/provider/Layers/CodexSessionRuntime.ts
+
+          if git diff --cached --quiet; then
+            echo "Overlay is already materialized."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: materialize Docker chat execution"
+          git push
