@@ -1,0 +1,237 @@
+name: Build latest upstream T3 Code + Docker
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - apps/server/src/docker/**
+      - scripts/apply-t3code-docker-overlay.mjs
+      - .github/workflows/upstream-docker-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-docker-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect newest official release
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.release.outputs.should_build }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - id: release
+        name: Compare official and custom releases
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$(gh api repos/pingdotgg/t3code/releases/latest --jq '.tag_name')"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Latest upstream release is not a plain stable tag: $tag" >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/$tag" >/dev/null 2>&1; then
+            echo "Custom release $tag already exists."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Official $tag has no matching Docker build yet."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  wsl-node-pty:
+    name: Build Linux node-pty for WSL
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout official T3 release
+        uses: actions/checkout@v4
+        with:
+          repository: pingdotgg/t3code
+          ref: ${{ needs.detect.outputs.tag }}
+          path: source
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: source/package.json
+          cache: true
+          run-install: false
+
+      - name: Install server dependencies
+        working-directory: source
+        run: vp install --filter=t3...
+
+      - name: Build Linux node-pty
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/source/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload WSL prebuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: wsl-node-pty-x64
+          path: source/wsl-prebuild/pty.node
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows x64 Docker edition
+    needs: [detect, wsl-node-pty]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: hibenji/t3code-docker
+    steps:
+      - name: Checkout Docker customization
+        uses: actions/checkout@v4
+        with:
+          path: custom
+
+      - name: Checkout exact official release
+        uses: actions/checkout@v4
+        with:
+          repository: pingdotgg/t3code
+          ref: ${{ needs.detect.outputs.tag }}
+          path: source
+
+      - name: Use official public T3 Connect configuration
+        shell: pwsh
+        run: Copy-Item source/.env.example source/.env -Force
+
+      - name: Add Docker implementation to official source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force source/apps/server/src/docker | Out-Null
+          Copy-Item custom/apps/server/src/docker/DockerCodex.ts source/apps/server/src/docker/DockerCodex.ts -Force
+          node custom/scripts/apply-t3code-docker-overlay.mjs --root source
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: source/package.json
+          cache: false
+          run-install: false
+
+      - name: Install desktop dependencies
+        working-directory: source
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Align package versions
+        working-directory: source
+        run: node scripts/update-release-package-versions.ts "${{ needs.detect.outputs.version }}"
+
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: wsl-node-pty-x64
+          path: source/wsl-prebuild
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Spectre-mitigated MSVC libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            throw "Visual Studio Installer failed with exit code $code"
+          }
+
+      - name: Typecheck patched server
+        working-directory: source
+        run: vp run --filter t3 typecheck
+
+      - name: Build unsigned Windows installer
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact -- \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --build-version "${{ needs.detect.outputs.version }}" \
+            --wsl-prebuild "$GITHUB_WORKSPACE/source/wsl-prebuild/pty.node" \
+            --verbose
+
+      - name: Collect updater assets
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          for pattern in "release/*.exe" "release/*.blockmap" "release/*.yml"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+            done
+          done
+          test -n "$(find release-publish -maxdepth 1 -name '*.exe' -print -quit)"
+          test -n "$(find release-publish -maxdepth 1 -name '*.yml' -print -quit)"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: t3code-docker-windows-${{ needs.detect.outputs.version }}
+          path: source/release-publish/*
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish matching Docker release
+    needs: [detect, build-windows]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows assets
+        uses: actions/download-artifact@v4
+        with:
+          name: t3code-docker-windows-${{ needs.detect.outputs.version }}
+          path: release-assets
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.detect.outputs.tag }}
+          name: T3 Code Docker ${{ needs.detect.outputs.tag }}
+          body: |
+            T3 Code ${{ needs.detect.outputs.version }} with per-chat Docker-isolated Codex execution.
+            Built automatically from the matching official pingdotgg/t3code release.
+
+            Windows x64 build is currently unsigned.
+          files: release-assets/*
+          fail_on_unmatched_files: true
