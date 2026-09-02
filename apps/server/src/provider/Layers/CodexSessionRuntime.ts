@@ -160,7 +160,10 @@ export interface CodexSessionRuntimeOptions {
   readonly homePath?: string;
   readonly launchArgs?: string;
   readonly environment?: NodeJS.ProcessEnv;
+  /** Working directory reported to Codex and used by thread/start. */
   readonly cwd: string;
+  /** Optional host working directory used only to spawn a wrapper process. */
+  readonly processCwd?: string;
   readonly runtimeMode: RuntimeMode;
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
@@ -1189,7 +1192,7 @@ export const makeCodexSessionRuntime = (
     const child = yield* spawner
       .spawn(
         ChildProcess.make(spawnCommand.command, spawnCommand.args, {
-          cwd: options.cwd,
+          cwd: options.processCwd ?? options.cwd,
           env,
           extendEnv,
           forceKillAfter: CODEX_APP_SERVER_FORCE_KILL_AFTER,
