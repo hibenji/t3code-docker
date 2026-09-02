@@ -12,7 +12,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: t3code-docker-side-by-side-final-v3
+  group: t3code-docker-side-by-side-final-v4
   cancel-in-progress: false
 
 jobs:
