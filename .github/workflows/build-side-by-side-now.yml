@@ -1,0 +1,181 @@
+name: Build side-by-side T3 Code Docker
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/build-side-by-side-now.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: t3code-docker-side-by-side-now
+  cancel-in-progress: false
+
+jobs:
+  wsl-node-pty:
+    name: Build Linux node-pty for WSL
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout Docker edition
+        uses: actions/checkout@v4
+
+      - id: version
+        name: Resolve Docker edition version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./apps/desktop/package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v${version}-docker.1" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Install server dependencies
+        run: vp install --filter=t3...
+
+      - name: Build Linux node-pty
+        shell: bash
+        run: |
+          set -euo pipefail
+          pty_pkg="$(node -e "console.log(require.resolve('node-pty/package.json', { paths: ['$GITHUB_WORKSPACE/apps/server'] }))")"
+          pty_dir="$(dirname "$pty_pkg")"
+          ( cd "$pty_dir" && npx --yes node-gyp rebuild )
+          mkdir -p wsl-prebuild
+          cp "$pty_dir/build/Release/pty.node" wsl-prebuild/pty.node
+          file wsl-prebuild/pty.node
+
+      - name: Upload WSL prebuild
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-side-by-side-wsl-node-pty
+          path: wsl-prebuild/pty.node
+          if-no-files-found: error
+          retention-days: 1
+
+  windows:
+    name: Build Windows x64 installer
+    needs: wsl-node-pty
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      T3CODE_DESKTOP_UPDATE_REPOSITORY: hibenji/t3code-docker
+    steps:
+      - name: Checkout Docker edition
+        uses: actions/checkout@v4
+
+      - name: Use public T3 Connect configuration
+        shell: pwsh
+        run: Copy-Item .env.example .env -Force
+
+      - name: Apply side-by-side desktop identity
+        run: node scripts/apply-t3code-docker-branding.mjs
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: false
+          run-install: false
+
+      - name: Install desktop dependencies
+        run: vp install --filter=@t3tools/desktop... --filter=t3... --filter=@t3tools/scripts...
+
+      - name: Download WSL node-pty prebuild
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-side-by-side-wsl-node-pty
+          path: wsl-prebuild
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Spectre-mitigated MSVC libraries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $installPath = & $vswhere -products * -latest -property installationPath
+          $setupExe = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+          $proc = Start-Process -FilePath $setupExe `
+            -ArgumentList "modify", "--installPath", "`"$installPath`"", "--add", `
+            "Microsoft.VisualStudio.Component.VC.Tools.x86.x64.Spectre", "--quiet", "--norestart" `
+            -Wait -PassThru -NoNewWindow
+          if ($null -eq $proc -or $proc.ExitCode -ne 0) {
+            $code = if ($null -ne $proc) { $proc.ExitCode } else { 1 }
+            throw "Visual Studio Installer failed with exit code $code"
+          }
+
+      - name: Build unsigned Windows installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          vp run dist:desktop:artifact -- \
+            --platform win \
+            --target nsis \
+            --arch x64 \
+            --build-version "${{ needs.wsl-node-pty.outputs.version }}" \
+            --wsl-prebuild "$GITHUB_WORKSPACE/wsl-prebuild/pty.node" \
+            --verbose
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-publish
+          shopt -s nullglob
+          for pattern in "release/*.exe" "release/*.blockmap" "release/*.yml"; do
+            for file in $pattern; do
+              cp "$file" release-publish/
+            done
+          done
+          installer="$(find release-publish -maxdepth 1 -name 'T3-Code-Docker-*.exe' -print -quit)"
+          if [[ -z "$installer" ]]; then
+            echo "T3 Code Docker installer was not produced." >&2
+            ls -la release release-publish || true
+            exit 1
+          fi
+
+      - name: Upload installable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: T3-Code-Docker-${{ needs.wsl-node-pty.outputs.version }}-Windows-x64
+          path: release-publish/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.wsl-node-pty.outputs.tag }}
+          name: T3 Code Docker ${{ needs.wsl-node-pty.outputs.version }}
+          prerelease: false
+          make_latest: true
+          body: |
+            Installable Windows x64 build of T3 Code Docker.
+
+            This build has a separate desktop identity and can be installed alongside official T3 Code.
+
+            - Product: T3 Code Docker
+            - App ID: com.hibenji.t3code-docker
+            - Protocol: t3code-docker://
+            - Updater repository: hibenji/t3code-docker
+            - Docker isolation: selectable per Codex chat
+
+            The Windows executable is currently unsigned, so Windows SmartScreen may show a warning.
+          files: release-publish/*
+          fail_on_unmatched_files: true
