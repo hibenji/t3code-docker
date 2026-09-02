@@ -175,6 +175,15 @@ export function mapCodexModelCapabilities(
     });
   }
 
+  optionDescriptors.push({
+    id: "dockerExecution",
+    label: "Docker isolation",
+    description:
+      "Run this chat's Codex process in a dedicated Docker container with an isolated copy of the workspace.",
+    type: "boolean",
+    currentValue: false,
+  });
+
   return createModelCapabilities({
     optionDescriptors,
   });

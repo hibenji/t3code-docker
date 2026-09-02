@@ -39,9 +39,19 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
-import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import {
+  getModelSelectionBooleanOptionValue,
+  getModelSelectionStringOptionValue,
+} from "@t3tools/shared/model";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import {
+  prepareDockerCodexSession,
+  rewriteLocalUrlForDocker,
+  syncDockerWorkspaceToContainer,
+  syncDockerWorkspaceToHost,
+  type DockerCodexSession,
+} from "../../docker/DockerCodex.ts";
 
 import {
   ProviderAdapterRequestError,
@@ -93,6 +103,7 @@ interface CodexAdapterSessionContext {
   readonly scope: Scope.Closeable;
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
+  readonly dockerSession?: DockerCodexSession;
   stopped: boolean;
 }
 
@@ -1683,14 +1694,43 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           input.modelSelection?.instanceId === boundInstanceId
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
+        const useDocker =
+          input.modelSelection?.instanceId === boundInstanceId &&
+          getModelSelectionBooleanOptionValue(input.modelSelection, "dockerExecution") === true;
+        const hostCwd = input.cwd ?? process.cwd();
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const runtimeEnvironment = mcpSession
+          ? {
+              ...(options?.environment ?? process.env),
+              T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
+            }
+          : options?.environment;
+        const dockerSession = useDocker
+          ? yield* prepareDockerCodexSession({
+              threadId: input.threadId,
+              cwd: hostCwd,
+              ...(codexConfig.homePath ? { homePath: codexConfig.homePath } : {}),
+              ...(runtimeEnvironment ? { environment: runtimeEnvironment } : {}),
+            }).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterProcessError({
+                    provider: PROVIDER,
+                    threadId: input.threadId,
+                    detail: cause.message,
+                    cause,
+                  }),
+              ),
+            )
+          : undefined;
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
-          cwd: input.cwd ?? process.cwd(),
-          binaryPath: codexConfig.binaryPath,
+          cwd: dockerSession?.workspacePath ?? hostCwd,
+          ...(dockerSession ? { processCwd: hostCwd } : {}),
+          binaryPath: dockerSession?.binaryPath ?? codexConfig.binaryPath,
           launchArgs: resolveCodexLaunchArgs(codexConfig.launchArgs, options?.environment),
-          ...(options?.environment ? { environment: options.environment } : {}),
+          ...(runtimeEnvironment ? { environment: runtimeEnvironment } : {}),
           ...(codexConfig.homePath ? { homePath: codexConfig.homePath } : {}),
           ...(isCodexResumeCursorSchema(input.resumeCursor)
             ? { resumeCursor: input.resumeCursor }
@@ -1702,13 +1742,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ...(serviceTier ? { serviceTier } : {}),
           ...(mcpSession
             ? {
-                environment: {
-                  ...(options?.environment ?? process.env),
-                  T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
-                },
                 appServerArgs: [
                   "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
+                  `mcp_servers.t3-code.url=${
+                    dockerSession ? rewriteLocalUrlForDocker(mcpSession.endpoint) : mcpSession.endpoint
+                  }`,
                   "-c",
                   'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
                 ],
@@ -1743,6 +1781,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
+            if (dockerSession && event.method === "turn/completed") {
+              yield* syncDockerWorkspaceToHost(dockerSession).pipe(
+                Effect.catch((cause) =>
+                  Effect.logError("failed to mirror Docker workspace after Codex turn", {
+                    threadId: input.threadId,
+                    containerName: dockerSession.containerName,
+                    cause,
+                  }),
+                ),
+              );
+            }
             const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
@@ -1781,6 +1830,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           scope: sessionScope,
           runtime,
           eventFiber,
+          ...(dockerSession ? { dockerSession } : {}),
           stopped: false,
         });
         sessionScopeTransferred = true;
@@ -1832,6 +1882,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
 
     const session = yield* requireSession(input.threadId);
+    if (session.dockerSession) {
+      yield* syncDockerWorkspaceToContainer(session.dockerSession).pipe(
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+              detail: `Failed to refresh Docker workspace before Codex turn: ${cause.message}`,
+              cause,
+            }),
+        ),
+      );
+    }
     const reasoningEffort =
       input.modelSelection?.instanceId === boundInstanceId
         ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
@@ -1969,6 +2032,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     session.stopped = true;
     sessions.delete(session.threadId);
     yield* session.runtime.close.pipe(Effect.ignore);
+    if (session.dockerSession) {
+      yield* syncDockerWorkspaceToHost(session.dockerSession).pipe(
+        Effect.catch((cause) =>
+          Effect.logError("failed to mirror Docker workspace while stopping Codex session", {
+            threadId: session.threadId,
+            containerName: session.dockerSession?.containerName,
+            cause,
+          }),
+        ),
+      );
+    }
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
   });
