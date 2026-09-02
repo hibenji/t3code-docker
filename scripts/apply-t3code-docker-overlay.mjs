@@ -23,6 +23,51 @@ function replaceOnce(content, before, after, label) {
   return content.replace(before, after);
 }
 
+async function patchDockerCodex() {
+  const file = "apps/server/src/docker/DockerCodex.ts";
+  let content = await read(file);
+
+  const diagnosticsComment =
+    "// @effect-diagnostics nodeBuiltinImport:off - Docker workspace mirroring and cross-platform wrapper generation intentionally use Node filesystem/process primitives around the external Docker CLI.\n";
+  if (!content.startsWith("// @effect-diagnostics nodeBuiltinImport:off")) {
+    content = diagnosticsComment + content;
+  }
+
+  if (!content.includes('import * as Schema from "effect/Schema";')) {
+    content = replaceOnce(
+      content,
+      'import * as Effect from "effect/Effect";',
+      'import * as Effect from "effect/Effect";\nimport * as Schema from "effect/Schema";',
+      "DockerCodex Effect import",
+    );
+  }
+
+  if (!content.includes("export class DockerCodexOperationError")) {
+    const errorHelper = `function errorMessage(cause: unknown): string {\n  return cause instanceof Error ? cause.message : String(cause);\n}`;
+    const taggedError = `${errorHelper}\n\nexport class DockerCodexOperationError extends Schema.TaggedErrorClass<DockerCodexOperationError>()(\n  "DockerCodexOperationError",\n  {\n    action: Schema.String,\n    detail: Schema.String,\n    cause: Schema.Defect(),\n  },\n) {\n  override get message(): string {\n    return \`${"${this.action}: ${this.detail}"}\`;\n  }\n}\n\nfunction dockerOperationError(action: string, cause: unknown): DockerCodexOperationError {\n  return new DockerCodexOperationError({\n    action,\n    detail: errorMessage(cause),\n    cause,\n  });\n}`;
+    content = replaceOnce(content, errorHelper, taggedError, "DockerCodex error helper");
+  }
+
+  content = content.replaceAll(
+    "Effect.Effect<void, Error>",
+    "Effect.Effect<void, DockerCodexOperationError>",
+  );
+  content = content.replaceAll(
+    "Effect.Effect<DockerCodexSession, Error>",
+    "Effect.Effect<DockerCodexSession, DockerCodexOperationError>",
+  );
+  content = content.replace(
+    'catch: (cause) => new Error(`${action}: ${errorMessage(cause)}`),',
+    "catch: (cause) => dockerOperationError(action, cause),",
+  );
+  content = content.replace(
+    "catch: (cause) => (cause instanceof Error ? cause : new Error(errorMessage(cause))),",
+    'catch: (cause) => dockerOperationError("Docker session preparation failed", cause),',
+  );
+
+  await write(file, content);
+}
+
 async function patchCodexProvider() {
   const file = "apps/server/src/provider/Layers/CodexProvider.ts";
   let content = await read(file);
@@ -100,7 +145,7 @@ async function patchCodexAdapter() {
 
   if (!content.includes("failed to mirror Docker workspace after Codex turn")) {
     const before = `            yield* writeNativeEvent(event);\n            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);`;
-    const after = `            yield* writeNativeEvent(event);\n            if (dockerSession && event.method === "turn/completed") {\n              yield* syncDockerWorkspaceToHost(dockerSession).pipe(\n                Effect.catchAll((cause) =>\n                  Effect.logError("failed to mirror Docker workspace after Codex turn", {\n                    threadId: input.threadId,\n                    containerName: dockerSession.containerName,\n                    cause,\n                  }),\n                ),\n              );\n            }\n            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);`;
+    const after = `            yield* writeNativeEvent(event);\n            if (dockerSession && event.method === "turn/completed") {\n              yield* syncDockerWorkspaceToHost(dockerSession).pipe(\n                Effect.catch((cause) =>\n                  Effect.logError("failed to mirror Docker workspace after Codex turn", {\n                    threadId: input.threadId,\n                    containerName: dockerSession.containerName,\n                    cause,\n                  }),\n                ),\n              );\n            }\n            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);`;
     content = replaceOnce(content, before, after, "Codex event Docker sync");
   }
 
@@ -121,13 +166,25 @@ async function patchCodexAdapter() {
 
   if (!content.includes("failed to mirror Docker workspace while stopping Codex session")) {
     const before = `    yield* session.runtime.close.pipe(Effect.ignore);\n    yield* Effect.ignore(Scope.close(session.scope, Exit.void));`;
-    const after = `    yield* session.runtime.close.pipe(Effect.ignore);\n    if (session.dockerSession) {\n      yield* syncDockerWorkspaceToHost(session.dockerSession).pipe(\n        Effect.catchAll((cause) =>\n          Effect.logError("failed to mirror Docker workspace while stopping Codex session", {\n            threadId: session.threadId,\n            containerName: session.dockerSession?.containerName,\n            cause,\n          }),\n        ),\n      );\n    }\n    yield* Effect.ignore(Scope.close(session.scope, Exit.void));`;
+    const after = `    yield* session.runtime.close.pipe(Effect.ignore);\n    if (session.dockerSession) {\n      yield* syncDockerWorkspaceToHost(session.dockerSession).pipe(\n        Effect.catch((cause) =>\n          Effect.logError("failed to mirror Docker workspace while stopping Codex session", {\n            threadId: session.threadId,\n            containerName: session.dockerSession?.containerName,\n            cause,\n          }),\n        ),\n      );\n    }\n    yield* Effect.ignore(Scope.close(session.scope, Exit.void));`;
     content = replaceOnce(content, before, after, "Codex stopSession Docker sync");
   }
+
+  // Upgrade already-materialized branches from the Effect v3 name used by the
+  // first overlay revision without touching unrelated upstream code.
+  content = content.replace(
+    "syncDockerWorkspaceToHost(dockerSession).pipe(\n                Effect.catchAll(",
+    "syncDockerWorkspaceToHost(dockerSession).pipe(\n                Effect.catch(",
+  );
+  content = content.replace(
+    "syncDockerWorkspaceToHost(session.dockerSession).pipe(\n        Effect.catchAll(",
+    "syncDockerWorkspaceToHost(session.dockerSession).pipe(\n        Effect.catch(",
+  );
 
   await write(file, content);
 }
 
+await patchDockerCodex();
 await patchCodexProvider();
 await patchCodexSessionRuntime();
 await patchCodexAdapter();
