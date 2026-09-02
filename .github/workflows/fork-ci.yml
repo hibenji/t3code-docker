@@ -1,0 +1,87 @@
+name: Fork CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  server:
+    name: Docker feature typecheck and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check overlay script syntax
+        run: node --check scripts/apply-t3code-docker-overlay.mjs
+
+      - name: Verify materialized overlay is current
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/apply-t3code-docker-overlay.mjs
+          git diff --exit-code -- \
+            apps/server/src/provider/Layers/CodexProvider.ts \
+            apps/server/src/provider/Layers/CodexAdapter.ts \
+            apps/server/src/provider/Layers/CodexSessionRuntime.ts
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@v1
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: true
+
+      - name: Typecheck server
+        run: vp run --filter t3 typecheck
+
+      - name: Test server
+        run: vp run --filter t3 test
+
+  upstream-overlay:
+    name: Overlay applies to upstream main
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout customization
+        uses: actions/checkout@v4
+        with:
+          path: custom
+
+      - name: Checkout upstream T3 Code
+        uses: actions/checkout@v4
+        with:
+          repository: pingdotgg/t3code
+          ref: main
+          path: upstream
+
+      - name: Apply customization to clean upstream checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p upstream/apps/server/src/docker
+          cp custom/apps/server/src/docker/DockerCodex.ts upstream/apps/server/src/docker/DockerCodex.ts
+          node custom/scripts/apply-t3code-docker-overlay.mjs --root upstream
+
+      - name: Confirm expected files changed
+        working-directory: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --check
+          git diff --exit-code --quiet && {
+            echo "Overlay unexpectedly made no source changes." >&2
+            exit 1
+          }
+          git status --short
