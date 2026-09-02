@@ -34,6 +34,7 @@ jobs:
         run: |
           set -euo pipefail
           git add \
+            apps/server/src/docker/DockerCodex.ts \
             apps/server/src/provider/Layers/CodexProvider.ts \
             apps/server/src/provider/Layers/CodexAdapter.ts \
             apps/server/src/provider/Layers/CodexSessionRuntime.ts
