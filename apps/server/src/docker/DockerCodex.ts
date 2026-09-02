@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Docker workspace mirroring and cross-platform wrapper generation intentionally use Node filesystem/process primitives around the external Docker CLI.
 import { execFile } from "node:child_process";
 import * as NodeFs from "node:fs/promises";
 import * as NodeOs from "node:os";
@@ -6,6 +7,7 @@ import { promisify } from "node:util";
 
 import type { ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 
 const execFileAsync = promisify(execFile);
 
@@ -63,6 +65,27 @@ export interface PrepareDockerCodexSessionInput {
 
 function errorMessage(cause: unknown): string {
   return cause instanceof Error ? cause.message : String(cause);
+}
+
+export class DockerCodexOperationError extends Schema.TaggedErrorClass<DockerCodexOperationError>()(
+  "DockerCodexOperationError",
+  {
+    action: Schema.String,
+    detail: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `${this.action}: ${this.detail}`;
+  }
+}
+
+function dockerOperationError(action: string, cause: unknown): DockerCodexOperationError {
+  return new DockerCodexOperationError({
+    action,
+    detail: errorMessage(cause),
+    cause,
+  });
 }
 
 async function docker(args: ReadonlyArray<string>, cwd?: string): Promise<string> {
@@ -409,32 +432,32 @@ async function prepare(input: PrepareDockerCodexSessionInput): Promise<DockerCod
   }
 }
 
-function asEffect(operation: () => Promise<void>, action: string): Effect.Effect<void, Error> {
+function asEffect(operation: () => Promise<void>, action: string): Effect.Effect<void, DockerCodexOperationError> {
   return Effect.tryPromise({
     try: operation,
-    catch: (cause) => new Error(`${action}: ${errorMessage(cause)}`),
+    catch: (cause) => dockerOperationError(action, cause),
   });
 }
 
 export function prepareDockerCodexSession(
   input: PrepareDockerCodexSessionInput,
-): Effect.Effect<DockerCodexSession, Error> {
+): Effect.Effect<DockerCodexSession, DockerCodexOperationError> {
   return Effect.tryPromise({
     try: () => prepare(input),
-    catch: (cause) => (cause instanceof Error ? cause : new Error(errorMessage(cause))),
+    catch: (cause) => dockerOperationError("Docker session preparation failed", cause),
   });
 }
 
 export function syncDockerWorkspaceToContainer(
   session: DockerCodexSession,
-): Effect.Effect<void, Error> {
+): Effect.Effect<void, DockerCodexOperationError> {
   return asEffect(
     () => syncWorkspaceToContainer(session.containerName, session.hostWorkspacePath),
     "Failed to refresh Docker workspace from host",
   );
 }
 
-export function syncDockerWorkspaceToHost(session: DockerCodexSession): Effect.Effect<void, Error> {
+export function syncDockerWorkspaceToHost(session: DockerCodexSession): Effect.Effect<void, DockerCodexOperationError> {
   return asEffect(
     () => syncWorkspaceToHost(session.containerName, session.hostWorkspacePath),
     "Failed to mirror Docker workspace back to host",

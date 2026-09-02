@@ -1783,7 +1783,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             yield* writeNativeEvent(event);
             if (dockerSession && event.method === "turn/completed") {
               yield* syncDockerWorkspaceToHost(dockerSession).pipe(
-                Effect.catchAll((cause) =>
+                Effect.catch((cause) =>
                   Effect.logError("failed to mirror Docker workspace after Codex turn", {
                     threadId: input.threadId,
                     containerName: dockerSession.containerName,
@@ -2034,7 +2034,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     yield* session.runtime.close.pipe(Effect.ignore);
     if (session.dockerSession) {
       yield* syncDockerWorkspaceToHost(session.dockerSession).pipe(
-        Effect.catchAll((cause) =>
+        Effect.catch((cause) =>
           Effect.logError("failed to mirror Docker workspace while stopping Codex session", {
             threadId: session.threadId,
             containerName: session.dockerSession?.containerName,
